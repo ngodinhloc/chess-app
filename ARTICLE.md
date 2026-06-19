@@ -1,10 +1,12 @@
-# Building a Stateful LLM Application: Chess App
+# Stateful AI: Designing LLM Applications That Maintain Context
 
 Chess is a natural fit for exploring stateful LLM patterns. Every move depends on everything that came before it — the LLM needs the full game history to understand the current position and play intelligently. This is the core challenge: LLMs are stateless by nature, but the application is not.
 
-This article walks through the implementation of a chess app where the user plays against Claude acting as an AI engine. You play as White via a drag-and-drop board. After each move, Claude picks a legal reply and writes a natural-language comment in the chat panel. Both the move quality and the commentary style adapt to the selected engine level — Amateur, Intermediate, or Professional.
+This article walks through the implementation of a chess app where the user plays against Claude acting as an AI engine.
+- User plays as White via a drag-and-drop board.
+- After each move, Claude picks a legal reply and writes a natural-language comment in the chat panel. Both the move quality and the commentary style adapt to the selected engine level — Amateur, Intermediate, or Professional.
 
-The focus is on the patterns that make this work in practice: a two-tier state model (Redis + PostgreSQL), fire-and-forget decoupling, a single LLM call that produces both a structured move and free-form commentary, and client-side ply navigation over a flat move array.
+The interesting parts are how state is managed across two services, how the LLM call is decoupled from the HTTP layer, and how a single prompt produces both a move and a comment.
 
 ![Game setup with history sidebar and level selector open](./screenshot_1.png)
 
@@ -14,42 +16,30 @@ The focus is on the patterns that make this work in practice: a two-tier state m
 
 ## Architecture Overview
 
-```
-Browser (React + Vite)
-    │  drags piece → POST /api/game/{id}/move
-    │  polls GET /api/game/{id} every 2s
-    ▼
-Backend (NestJS)              ──── PostgreSQL (persistence)
-    │  fire-and-forget POST         Redis (live game state)
-    ▼                               ▲
-AI Engine (FastAPI + LangGraph) ────┘
-    │  replays history with python-chess
-    │  invokes Claude to pick reply
-    └── writes engine move to Redis
-```
+![Architecture diagram](./architecture.png)
 
-**Redis is the shared live-state channel.** The backend fires the engine request without waiting for it to finish, so the HTTP response returns in milliseconds. The frontend polls every two seconds and picks up the engine's move as soon as it lands in Redis.
+**Frontend** (React + Vite, port 3000) — drag-and-drop board, move list, and chat panel. Polls `GET /api/game/{id}` every 2 s during play to pick up the engine's reply, and supports ply-by-ply replay of completed games.
 
-**PostgreSQL is the persistent store.** When the user stops a game, the flat `GameMove[]` array is written to the `moves` column and the Redis key is deleted. History reads come from PostgreSQL; live reads come from Redis.
+**Backend** (NestJS, port 8000) — REST API:
+- `POST /api/game/new` — create game in PostgreSQL + Redis, fire greeting to AI Engine
+- `POST /api/game/:id/move` — append user move to Redis, fire-and-forget to AI Engine (returns 202)
+- `POST /api/game/:id/stop` — persist full move array to PostgreSQL, delete Redis key
+- `GET /api/game/:id` — return live game from Redis, or persisted game from PostgreSQL
+- `GET /api/game/history` — return last 50 games from PostgreSQL
 
----
+**AI Engine** (FastAPI + LangGraph, port 8001) — loads the current game from Redis, validates the user's move with `python-chess`, then invokes Claude (`claude-sonnet-4-6`) with the current FEN, legal moves, and engine level. Claude returns a single JSON object with `notation` (the chosen move in SAN) and `message` (natural-language commentary). The engine appends the agent move to the game and writes it back to Redis.
 
-## Tech Stack
+**Redis** — live game state during play, keyed by `game:{uuid}`; shared by the backend and AI Engine so no inter-service polling is needed.
 
-| Layer | Technology |
-|-------|-----------|
-| Frontend | React 19, Vite, Tailwind CSS, react-chessboard, chess.js |
-| Backend | NestJS 11, TypeORM, ioredis |
-| AI Engine | FastAPI, LangGraph, LangChain Anthropic, python-chess |
-| LLM | Claude (claude-sonnet-4-6) |
-| Storage | PostgreSQL (persistence), Redis (live state) |
-| Infrastructure | Docker Compose |
+**PostgreSQL** — persistent store; written once when a game starts (empty) and again when it stops (full move array). All history and replay reads come from here.
 
 ---
 
 ## Step 1 — Design the Move Data Model
 
-Every event in the game is a `GameMove`. The flat array is the single source of truth for both the board and the chat panel:
+The first question was: what's the minimal structure that can drive both the board and the chat panel without needing two separate data models?
+
+The answer is a flat `GameMove` array. Every event in the game — user moves, engine replies, the opening greeting, game-over messages — is the same shape:
 
 ```typescript
 interface GameMove {
@@ -60,7 +50,7 @@ interface GameMove {
 }
 ```
 
-User and engine responses to the same move share the same `order` number. This makes the display table trivial to build — group by `order`, render white (user) and black (engine) side by side:
+User and engine responses to the same move share the same `order` number. Building the move list is just grouping by `order`:
 
 ```
 1.  b4    e5
@@ -74,17 +64,17 @@ The `message` field on each engine row is what appears in the chat panel alongsi
 
 > **Engine** `Bxb4` Oh wow, a free bishop capture! I'll grab that pawn — free material is always good, right? 😄 Though I have a feeling you might have something tricky planned...
 
-Storing everything as `GameMove` means the data is self-contained — no separate chat table, no joined queries. The full game, including every commentary message, lives in a single `jsonb` column.
+Storing everything as `GameMove` means there's no separate chat table, no joined queries. The full game, including every commentary message, lives in a single `jsonb` column.
 
 ---
 
 ## Step 2 — Two-Tier State: Redis and PostgreSQL
 
-The application maintains game state in two places with distinct roles.
+Game state lives in two places, and they serve different purposes.
 
-**Redis holds live game state.** Each key `game:{uuid}` contains the full `GameInterface` as JSON. Both the backend (move recording) and the AI Engine (engine response) read and write this key. It is the communication channel between the two services.
+Redis holds live state during play. The key `game:{uuid}` contains the full `GameInterface` as JSON. Both the backend and the AI Engine read and write the same key — it's the shared channel between the two services.
 
-**PostgreSQL persists completed games.** When the user stops a game, the backend loads the `GameInterface` from Redis, writes the full `moves` array to the `games` table, and deletes the Redis key:
+PostgreSQL holds completed games. When the user stops a game, the backend reads from Redis, writes everything to the `games` table, and deletes the Redis key:
 
 ```typescript
 async stopGame(id: string): Promise<{ stopped: true }> {
@@ -125,13 +115,15 @@ async getGame(id: string): Promise<GameInterface> {
 }
 ```
 
-The `status: 'stopped'` flag drives the entire history-view UI: read-only board, interactive move list, visible chat without input, hidden Stop button. No separate mode flag is needed — the game status is the mode.
+`status: 'stopped'` drives the entire history-view UI: read-only board, interactive move list, visible chat without input, hidden Stop button. No separate mode flag needed — the game status is the mode.
 
 ---
 
 ## Step 3 — Decouple the Engine from the API Layer
 
-Running the AI Engine synchronously inside the HTTP request would hold the connection open for the full LLM round-trip — 1–5 seconds per move. The solution is **fire-and-forget**: the backend appends the user's move to Redis and returns `202 Accepted` immediately, while the engine runs in the background.
+The obvious approach would be to call the AI Engine from inside the HTTP handler and wait for the response. That's a problem — LLM round-trips take 1–5 seconds, and holding the connection open that long for every move is a bad user experience.
+
+The fix is fire-and-forget. The backend appends the user's move to Redis and returns `202 Accepted` immediately. The engine runs in the background:
 
 ```typescript
 // NestJS AgentService
@@ -151,19 +143,19 @@ notifyMove(gameId: string, move: { actor: string; order: number; notation: strin
 }
 ```
 
-No `await`. The Observable is subscribed to only for its error side-effect. The HTTP response to the frontend has already been sent by the time this resolves.
+No `await`. The Observable is subscribed to only to catch errors. The HTTP response to the frontend is already sent by the time this resolves.
 
-The same pattern fires on game creation (`order: 0`, empty notation) so the engine can send a greeting before the user makes any move.
+The same pattern fires on game creation (`order: 0`, empty notation) so the engine can send a greeting before the user's first move.
 
-**Redis over WebSockets.** A 2-second poll interval is imperceptible for a chess game where the engine takes several seconds to respond. Redis with polling is simpler to operate, trivially debuggable (`redis-cli get game:{uuid}`), and requires no sticky sessions.
+Instead of WebSockets, the frontend just polls every 2 seconds. For a chess game where the engine takes a few seconds to respond, polling is perfectly fine — and it's much simpler to debug (`redis-cli get game:{uuid}` tells you exactly what state the game is in).
 
 ---
 
 ## Step 4 — One LLM Call, Two Outputs
 
-A chess engine does not need external tools. `python-chess` provides the board state and the complete list of legal moves in standard algebraic notation. But the LLM is not just picking a move — it is also writing a comment about that move in a tone calibrated to the engine level. Both happen in a single prompt invocation.
+`python-chess` already handles the hard part — it knows the board position and can enumerate every legal move. The LLM doesn't need tools for that.
 
-The LLM receives the full board context and produces a single JSON response:
+What the LLM needs to do is: pick a move from the legal list, and write a comment about it, in a style that matches the engine level. Those two things happen in a single prompt:
 
 ```python
 _SYSTEM_TEMPLATE = """You are a chess engine. Your engine level is: {level}.
@@ -182,7 +174,7 @@ Respond with a JSON object only:
 {{"notation": "<one_move_from_legal_moves>", "message": "<brief comment about your move>"}}"""
 ```
 
-Move quality and commentary voice both shift with `engine_level` from the same prompt. Here is what the Amateur engine produced across several consecutive moves in a real game (Ken playing the Polish Opening, 1.b4):
+The engine level shapes both the move quality and the commentary voice in one shot. Here's what the Amateur engine produced across a real game (Ken playing the Polish Opening, 1.b4):
 
 ```
 User:  b4    →  Engine: e5    — "Great opening with 1.b4 - the Polish Opening!
@@ -199,11 +191,9 @@ User:  g3    →  Engine: Qxg3+ — "Taking that pawn with check! Your king look
                                   exposed. I'm feeling good about this position! 😄"
 ```
 
-The Amateur narrates its own reasoning — admitting uncertainty, celebrating material grabs, noticing threats belatedly. A Professional produces the same JSON structure but with terse, precise analysis. The engine level instruction shapes both outputs simultaneously.
+The Amateur narrates its own reasoning — admitting uncertainty, celebrating material grabs, noticing threats belatedly. A Professional produces the same JSON structure but with terse, precise analysis. Combining move selection and commentary in one call also avoids two round-trips, and means the comment is naturally about the move that was actually chosen.
 
-Combining move selection and commentary in one call avoids two round-trips and keeps the instruction coherent — splitting them would require the second call to know what the first decided.
-
-The response is parsed as JSON. If parsing fails or the chosen notation is not in the legal moves list, the service falls back to the first legal move — the game continues regardless of what the LLM returns:
+If parsing fails or the chosen notation isn't in the legal moves list, the service falls back to the first legal move — the game continues regardless:
 
 ```python
 if agent_notation not in legal_moves:
@@ -221,7 +211,7 @@ if agent_notation not in legal_moves:
 
 ## Step 5 — The LangGraph Graph
 
-The engine logic uses LangGraph with a single node — no tool nodes needed because `python-chess` provides the legal moves directly:
+The engine uses LangGraph with a single node. There are no tool calls — `python-chess` already provides the legal moves, so the LLM doesn't need to query anything:
 
 ```python
 class AgentGraph:
@@ -234,7 +224,7 @@ class AgentGraph:
         return graph.compile()
 ```
 
-`AgentState` extends LangGraph's built-in `MessagesState` with chess-specific fields:
+`AgentState` extends LangGraph's `MessagesState` with chess-specific fields:
 
 ```python
 class AgentState(MessagesState):
@@ -247,42 +237,52 @@ class AgentState(MessagesState):
 
 `fen`, `legal_moves`, and `engine_level` are set by `GameService` before the graph runs. `notation` and `message` are the two outputs written by the agent node and stored together in the same `GameMove` record.
 
-The value of using LangGraph here — even for a single node — is extensibility. Adding an opening book lookup or endgame tablebase query later requires one new node, not a restructure.
+A single-node graph is arguably overkill, but using LangGraph from the start means adding an opening book lookup or endgame tablebase later is just another node — no restructuring needed.
 
 ---
 
 ## Step 6 — Validate Moves with python-chess
 
-`python-chess` is the authoritative source of board truth. The AI Engine replays every prior move to rebuild the board before each decision:
+The AI Engine can't trust that the move stored in Redis is legal — the backend appended it without validating. So the engine replays the full move history to rebuild the board before each decision. That logic lives in `BoardManager`:
 
 ```python
-board = chess.Board()
-for move in game.moves:
-    if not move.notation:
-        continue
-    if move.actor == Actor.user and move.order == request.order:
-        continue  # will validate below
-    try:
-        board.push_san(move.notation)
-    except Exception:
-        pass
+class BoardManager:
+    def build(self, moves: list[GameMove], skip_user_order: int | None = None) -> chess.Board:
+        board = chess.Board()
+        for move in moves:
+            if not move.notation:
+                continue
+            if skip_user_order is not None and move.actor == Actor.user and move.order == skip_user_order:
+                continue
+            try:
+                board.push_san(move.notation)
+            except Exception:
+                pass
+        return board
+
+    def apply_move(self, board: chess.Board, notation: str) -> bool:
+        try:
+            board.push_san(notation)
+            return True
+        except (ValueError, chess.IllegalMoveError, chess.InvalidMoveError, chess.AmbiguousMoveError):
+            return False
 ```
 
-The current user move is skipped during replay because the backend appended it to Redis before the engine received the request — but it has not been validated yet. It gets validated separately:
+The current user move is skipped during replay (`skip_user_order`) because it hasn't been validated yet. `GameService` then tries to apply it separately:
 
 ```python
+board = self._board_manager.build(game.moves, skip_user_order=request.order)
+
 if request.actor == Actor.user:
-    try:
-        board.push_san(request.notation)
-    except (ValueError, chess.IllegalMoveError, chess.InvalidMoveError, chess.AmbiguousMoveError):
-        self._update_move_message(game, request.order, Actor.user, "That move is not legal. Try again!")
-        await self._redis.set(key, game.model_dump_json())
+    if not self._board_manager.apply_move(board, request.notation):
+        self._game_manager.update_move_message(game, request.order, Actor.user, "That move is not legal. Try again!")
+        await self._game_manager.save(request.game_uuid, game)
         return
 ```
 
-If the move is illegal, the service writes an error message onto the move and returns without invoking the LLM. The frontend picks it up on the next poll and shows the error in the chat panel.
+If the move is illegal, the service writes an error message onto the move record and returns without calling Claude. The frontend picks it up on the next poll and shows the error in the chat panel.
 
-After the user's move is pushed, the engine checks for terminal states before asking Claude for a reply:
+After the user's move is applied, the engine checks for terminal states before asking Claude for a reply:
 
 ```python
 if board.is_game_over():
@@ -294,13 +294,13 @@ legal_moves = [board.san(m) for m in board.legal_moves]
 
 `board.legal_moves` is the full legal move generator; `board.san(m)` converts each `Move` object to the same SAN format the LLM is asked to produce — keeping the format consistent in both directions.
 
-Replaying the full move history on every engine call is safe because games are short and SAN moves are deterministic. The board object is rebuilt fresh each time from the stored move array.
+Replaying the full history on every call is fine because games are short and SAN moves are deterministic. The board is rebuilt fresh each time from the stored move array.
 
 ---
 
 ## Step 7 — Build FEN from the Move Array on the Client
 
-The frontend never stores the board position directly. It stores the raw `GameMove[]` from the API and derives the FEN on demand using `chess.js`:
+The frontend doesn't store board positions. It stores the raw `GameMove[]` from the API and derives the FEN on demand using `chess.js`:
 
 ```typescript
 function buildFen(moves: GameMove[]): string {
@@ -317,13 +317,11 @@ function buildFen(moves: GameMove[]): string {
 }
 ```
 
-`Chess.move()` accepts SAN notation and updates the internal board state. The FEN is passed to `react-chessboard` as `position`. Whenever the move array changes on a new poll, the FEN is recomputed and the board re-renders.
-
-Storing FEN alongside moves would create a secondary truth that can diverge. Deriving it from the move list is cheap (games have at most ~100 moves) and means the board is always consistent with the move record.
+Whenever the move array changes on a new poll, the FEN is recomputed and the board re-renders. Storing FEN alongside moves would create a secondary truth that can get out of sync — deriving it from the move list is cheap and always consistent.
 
 ### Ply Navigation in History View
 
-When the user clicks a move in a completed game's move list, the board shows the position at that ply — not the final position. The frontend tracks a `selectedPly` index:
+When the user clicks a move in a completed game's move list, the board shows the position at that ply. The frontend tracks a `selectedPly` index:
 
 ```typescript
 const chessMoves = allMoves.filter((m) => m.notation && m.order > 0)
@@ -332,9 +330,7 @@ const boardMoves = selectedPly !== null
   : allMoves
 ```
 
-`chessMoves` is the filtered list of notation-only moves in play order. Slicing to `selectedPly + 1` gives the board position at that point; the FEN is derived from that slice.
-
-The `MoveList` component assigns a `plyIndex` to each half-move as it builds the display pairs, and each white and black cell is a `<button>` that calls `onSelectPly(plyIndex)`. Ply navigation is a pure client-side operation — no round-trips. The full move array is already in memory from the initial game load.
+Slicing to `selectedPly + 1` gives the board position at that point; the FEN is derived from that slice. Each half-move in the move list is a button that calls `onSelectPly(plyIndex)`. No round-trips — the full move array is already in memory from the initial load.
 
 ![Amateur game with Polish Opening and casual emoji commentary](./screenshot_3.png)
 
@@ -344,7 +340,7 @@ The `MoveList` component assigns a `plyIndex` to each half-move as it builds the
 
 ## Step 8 — Centralise Dependency Injection
 
-The AI Engine has three wired dependencies: the compiled LangGraph, the Redis client, and `GameService`. A `Container` class owns all construction using `@cached_property` as the singleton mechanism:
+The AI Engine wires three dependencies: the compiled LangGraph, the Redis client, and `GameService`. A `Container` class owns all of it using `@cached_property` as a simple singleton mechanism:
 
 ```python
 class Container:
@@ -379,23 +375,23 @@ async def move(request: MoveRequest):
 
 ## Key Design Decisions
 
-**Stateful LLM via full history replay.** The LLM itself is stateless — it receives the current board position (FEN) and the list of legal moves on every call. The application reconstructs that context by replaying the full `GameMove[]` array with `python-chess` before each invocation. State lives in Redis, not in the LLM or the board object.
+**Full history replay for LLM context.** The LLM is stateless — it gets the current FEN and legal moves on every call. The application reconstructs that context by replaying the full `GameMove[]` with `python-chess` before each invocation. State lives in Redis, not in the model.
 
-**Two-tier storage.** Redis holds live game state during play (fast reads and writes, shared between backend and AI Engine). PostgreSQL holds completed games permanently. This separation keeps live-game latency low while providing reliable persistence for history and replay.
+**Redis + PostgreSQL split.** Redis keeps live-game latency low during play. PostgreSQL keeps completed games safe. Mixing them — e.g., writing every move to PostgreSQL — would add unnecessary write latency during play. Reading history from Redis would mean keeping keys alive indefinitely.
 
-**Fire-and-forget for engine calls.** Blocking the HTTP response for an LLM round-trip would hold a connection open for 1–5 seconds per move. Returning `202 Accepted` immediately and letting the frontend poll keeps the API responsive regardless of engine latency.
+**Fire-and-forget engine calls.** Blocking the HTTP response for an LLM round-trip holds a connection open for seconds per move. `202 Accepted` keeps the API fast and pushes the latency to the polling side, where it's less noticeable.
 
-**One LLM call, two outputs.** Move selection and commentary are combined in a single prompt. Splitting them into separate calls would double latency and require the second call to know what the first decided. The engine level instruction shapes both outputs simultaneously — move quality and commentary voice are governed by the same directive.
+**One LLM call for move + comment.** Two calls would double the latency and require the second to know what the first decided. One prompt with the engine level baked in gets both outputs in a single round-trip.
 
-**`python-chess` as the source of board truth.** The client uses `chess.js` for UI feedback (client-side move validation, FEN generation), but `python-chess` on the engine side is authoritative. The LLM only chooses from moves `python-chess` has already declared legal — the engine cannot produce an illegal move.
+**`python-chess` as the authoritative board.** `chess.js` handles client-side feedback, but `python-chess` is authoritative on the engine side. The LLM only picks from moves `python-chess` has already declared legal — it can't produce an illegal move.
 
-**Flat `GameMove[]` in PostgreSQL.** Storing the move array directly in the `jsonb` column means the DB row is the game — no separate tables for moves, no joins on history load. The full game, including every commentary message, is a single column value.
+**Flat `GameMove[]` in a jsonb column.** No separate moves table, no joins on history load. The full game, commentary included, is a single column value.
 
-**FEN derived on demand, not stored.** Storing FEN alongside moves would create a secondary truth that can diverge. Deriving FEN from the move list with `chess.js` on every render is cheap and means the board is always consistent with the record.
+**FEN derived on demand, not stored.** Storing FEN alongside moves creates a second truth that can diverge. Deriving it from the move list with `chess.js` on render is cheap and always consistent.
 
-**Ply navigation as a client-side slice.** Once the full `GameMove[]` is in memory, clicking any move in history view is a pure array-slice operation — no round-trip needed. This keeps the history UX instant and keeps the API surface small.
+**Ply navigation as a client-side slice.** Once the full `GameMove[]` is in memory, clicking any move is an array slice — no extra API call needed.
 
-**`status: 'stopped'` as the rendering switch.** A single field determines the full history-view UI: read-only board, interactive move list, visible chat without input. No separate mode flag is needed — the game status is the mode.
+**`status: 'stopped'` as the rendering switch.** One field drives the whole history UI: read-only board, interactive move list, no input. The game status is the mode.
 
 ---
 

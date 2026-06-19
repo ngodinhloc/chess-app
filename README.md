@@ -28,36 +28,22 @@ The same game captured in `moves.json`: Ken vs Amateur Engine, Polish Opening (1
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Browser                                                     │
-│  React + Vite frontend  (port 3000)                          │
-│  · Drag-and-drop chessboard (react-chessboard + chess.js)   │
-│  · Move list, chat panel, collapsible history sidebar        │
-│  · Ply-by-ply replay of completed games                      │
-└────────────────────────┬─────────────────────────────────────┘
-                         │ HTTP  /api/*  (Vite proxy)
-┌────────────────────────▼─────────────────────────────────────┐
-│  Backend  (NestJS · port 8000)                               │
-│  · REST game API                                             │
-│  · PostgreSQL  — persists completed games                    │
-│  · Redis       — live game state during play                 │
-│  · Fires async POST to AI Engine on every move (fire-and-forget)│
-└──────────┬───────────────────────────┬───────────────────────┘
-           │ async POST /api/game/move  │ read / write
-           │                           │
-┌──────────▼────────────────┐  ┌───────▼────────────┐
-│  AI Engine                │  │  Redis             │
-│  FastAPI · port 8001      │─▶│  key: game:{uuid}  │
-│  LangGraph single node    │  └────────────────────┘
-│  python-chess validation  │
-│  Claude picks the move    │
-└───────────────────────────┘
-```
+![Architecture diagram](./architecture.png)
 
-**Redis is the shared live-state channel.** The backend fires the engine request without waiting for it, so the HTTP response returns in milliseconds. The frontend polls every two seconds and picks up the engine's move as soon as it lands in Redis.
+**Frontend** (React + Vite, port 3000) — drag-and-drop board, move list, and chat panel. Polls `GET /api/game/{id}` every 2 s during play to pick up the engine's reply, and supports ply-by-ply replay of completed games.
 
-**PostgreSQL is the persistent store.** When the user stops a game, the full `GameMove[]` array is written to the `moves` column and the Redis key is deleted. History reads come from PostgreSQL; live reads come from Redis.
+**Backend** (NestJS, port 8000) — REST API:
+- `POST /api/game/new` — create game in PostgreSQL + Redis, fire greeting to AI Engine
+- `POST /api/game/:id/move` — append user move to Redis, fire-and-forget to AI Engine (returns 202)
+- `POST /api/game/:id/stop` — persist full move array to PostgreSQL, delete Redis key
+- `GET /api/game/:id` — return live game from Redis, or persisted game from PostgreSQL
+- `GET /api/game/history` — return last 50 games from PostgreSQL
+
+**AI Engine** (FastAPI + LangGraph, port 8001) — loads the current game from Redis, validates the user's move with `python-chess`, then invokes Claude (`claude-sonnet-4-6`) with the current FEN, legal moves, and engine level. Claude returns a single JSON object with `notation` (the chosen move in SAN) and `message` (natural-language commentary). The engine appends the agent move to the game and writes it back to Redis.
+
+**Redis** — live game state during play, keyed by `game:{uuid}`; shared by the backend and AI Engine so no inter-service polling is needed.
+
+**PostgreSQL** — persistent store; written once when a game starts (empty) and again when it stops (full move array). All history and replay reads come from here.
 
 ---
 

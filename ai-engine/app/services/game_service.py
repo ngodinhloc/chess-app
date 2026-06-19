@@ -1,59 +1,40 @@
 import logging
 import chess
-from fastapi import HTTPException
-from app.routers.contracts.game_interface import (
-    GameInterface, GameMove, Actor, MoveRequest,
-)
+from app.routers.contracts.game_interface import GameInterface, GameMove, Actor, MoveRequest
+from app.services.game_manager import GameManager
+from app.services.board_manager import BoardManager
 
 
 class GameService:
-    def __init__(self, graph, redis, logger: logging.Logger):
+    def __init__(self, graph, game_manager: GameManager, board_manager: BoardManager, logger: logging.Logger):
         self._graph = graph
-        self._redis = redis
+        self._game_manager = game_manager
+        self._board_manager = board_manager
         self._logger = logger
 
     async def handle(self, request: MoveRequest) -> None:
-        key = f"game:{request.game_uuid}"
-        raw = await self._redis.get(key)
-        if not raw:
-            raise HTTPException(status_code=404, detail=f"Game {request.game_uuid} not found")
-
-        game = GameInterface.model_validate_json(raw)
+        game = await self._game_manager.load(request.game_uuid)
 
         if request.order == 0:
-            await self._send_greeting(key, game)
+            await self._send_greeting(request.game_uuid, game)
             return
 
-        # Rebuild board from all previously validated moves, skipping the
-        # current user move that the backend just appended but hasn't been
-        # validated yet.
-        board = chess.Board()
-        for move in game.moves:
-            if not move.notation:
-                continue
-            if move.actor == Actor.user and move.order == request.order:
-                continue  # will validate below
-            try:
-                board.push_san(move.notation)
-            except Exception:
-                pass
+        board = self._board_manager.build(game.moves, skip_user_order=request.order)
 
         if request.actor == Actor.user:
-            try:
-                board.push_san(request.notation)
-            except (ValueError, chess.IllegalMoveError, chess.InvalidMoveError, chess.AmbiguousMoveError):
+            if not self._board_manager.apply_move(board, request.notation):
                 self._logger.warning("Illegal move %s for game %s", request.notation, request.game_uuid)
-                self._update_move_message(game, request.order, Actor.user, "That move is not legal. Try again!")
-                await self._redis.set(key, game.model_dump_json())
+                self._game_manager.update_move_message(game, request.order, Actor.user, "That move is not legal. Try again!")
+                await self._game_manager.save(request.game_uuid, game)
                 return
 
         if board.is_game_over():
-            await self._handle_game_over(key, game, board, request.order)
+            await self._handle_game_over(request.game_uuid, game, board, request.order)
             return
 
         legal_moves = [board.san(m) for m in board.legal_moves]
         if not legal_moves:
-            await self._handle_game_over(key, game, board, request.order)
+            await self._handle_game_over(request.game_uuid, game, board, request.order)
             return
 
         result = await self._graph.ainvoke({
@@ -80,10 +61,9 @@ class GameService:
             notation=agent_notation,
             message=agent_message,
         )
-        game.moves.append(agent_move)
-        await self._redis.set(key, game.model_dump_json())
+        await self._game_manager.append_move(request.game_uuid, game, agent_move)
 
-    async def _send_greeting(self, key: str, game: GameInterface) -> None:
+    async def _send_greeting(self, game_uuid: str, game: GameInterface) -> None:
         greeting = GameMove(
             actor=Actor.agent,
             order=0,
@@ -93,11 +73,10 @@ class GameService:
                 "You play as White — make your first move!"
             ),
         )
-        game.moves.append(greeting)
-        await self._redis.set(key, game.model_dump_json())
+        await self._game_manager.append_move(game_uuid, game, greeting)
 
     async def _handle_game_over(
-        self, key: str, game: GameInterface, board: chess.Board, order: int
+        self, game_uuid: str, game: GameInterface, board: chess.Board, order: int
     ) -> None:
         if board.is_checkmate():
             message = "Checkmate! Well played!"
@@ -109,12 +88,4 @@ class GameService:
             message = "Game over!"
 
         agent_move = GameMove(actor=Actor.agent, order=order, notation="", message=message)
-        game.moves.append(agent_move)
-        await self._redis.set(key, game.model_dump_json())
-
-    @staticmethod
-    def _update_move_message(game: GameInterface, order: int, actor: Actor, message: str) -> None:
-        for move in reversed(game.moves):
-            if move.order == order and move.actor == actor:
-                move.message = message
-                return
+        await self._game_manager.append_move(game_uuid, game, agent_move)
